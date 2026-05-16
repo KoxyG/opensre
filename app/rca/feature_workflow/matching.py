@@ -12,6 +12,13 @@ def _normalize_path(path: str) -> str:
     return stripped if stripped.startswith("/") else f"/{stripped}"
 
 
+def endpoint_mapping_matches(
+    mapping: EndpointMapping, path: str, *, method: str | None = None
+) -> bool:
+    """Return whether ``path`` matches a single endpoint mapping rule."""
+    return _endpoint_matches(mapping, path, method=method)
+
+
 def _endpoint_matches(mapping: EndpointMapping, path: str, *, method: str | None) -> bool:
     normalized = _normalize_path(path)
     pattern = _normalize_path(mapping.pattern)

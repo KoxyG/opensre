@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.rca.feature_workflow.matching import match_endpoint_tags
+from app.rca.feature_workflow.matching import endpoint_mapping_matches
 from app.rca.feature_workflow.models import FeatureWorkflowConfig, OperatorHint
 from app.rca.feature_workflow.signals import (
     EndpointMatch,
@@ -43,14 +43,13 @@ def _endpoint_match_strength(
     *,
     http_method: str | None,
 ) -> float:
-    if not endpoint or tag not in match_endpoint_tags(config, endpoint, method=http_method):
+    if not endpoint:
         return 0.0
     strength = 0.0
     for mapping in config.endpoints:
         if tag not in mapping.tags:
             continue
-        matched = match_endpoint_tags(config, endpoint, method=http_method)
-        if tag not in matched:
+        if not endpoint_mapping_matches(mapping, endpoint, method=http_method):
             continue
         if mapping.match == "exact":
             strength = max(strength, _EXACT_MATCH_STRENGTH)
@@ -88,8 +87,12 @@ def _score_topology(
         return 0.0, []
     score = 0.0
     drivers: list[str] = []
+    seen_services: set[str] = set()
     for observed in (signals.alert_service, signals.context_service):
-        if observed and observed == service:
+        if not observed or observed in seen_services:
+            continue
+        seen_services.add(observed)
+        if observed == service:
             score = max(score, 1.0)
             drivers.append(f"service_match:{observed}")
     if signals.namespace and signals.namespace == service:

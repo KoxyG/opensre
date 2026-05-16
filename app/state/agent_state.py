@@ -80,7 +80,8 @@ class AgentState(TypedDict, total=False):
     investigation_recommendations: list[str]
     remediation_steps: list[str]
     investigation_loop_count: int
-    # Feature/workflow hypothesis layer (issue #1441); populated in diagnose_root_cause.
+    # Feature/workflow hypothesis layer (issue #1441); merged in investigation.py via
+    # resolve_feature_workflow_fields (app/agent/feature_workflow.py).
     feature_workflow_candidates: list[dict[str, Any]]
     top_feature_workflow_candidate: dict[str, Any] | None
     correlation_pathway: list[dict[str, Any]]

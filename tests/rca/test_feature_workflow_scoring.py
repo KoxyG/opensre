@@ -7,8 +7,13 @@ from app.rca.feature_workflow.candidates import (
     top_feature_workflow_candidate,
 )
 from app.rca.feature_workflow.models import FeatureWorkflowConfig
-from app.rca.feature_workflow.scoring import ConfidenceBreakdown, score_feature_workflow_tag
-from app.rca.feature_workflow.signals import extract_investigation_signals
+from app.rca.feature_workflow.scoring import (
+    ConfidenceBreakdown,
+    _endpoint_match_strength,
+    _score_topology,
+    score_feature_workflow_tag,
+)
+from app.rca.feature_workflow.signals import InvestigationSignals, extract_investigation_signals
 
 
 def _two_tag_config() -> FeatureWorkflowConfig:
@@ -149,6 +154,56 @@ def test_runtime_hint_flips_winner_when_base_scores_close() -> None:
     assert top_boosted.feature_tag == "tag_b"
     tag_b_baseline = next(c for c in baseline if c.feature_tag == "tag_b")
     assert top_boosted.confidence > tag_b_baseline.confidence
+
+
+def test_score_topology_dedupes_service_match_when_alert_and_context_agree() -> None:
+    config = _two_tag_config()
+    signals = InvestigationSignals(
+        alert_service="payments-api",
+        context_service="payments-api",
+    )
+
+    score, drivers = _score_topology(config, "tag_a", signals)
+
+    assert score == 1.0
+    assert drivers.count("service_match:payments-api") == 1
+
+
+def test_endpoint_match_strength_prefix_only_when_exact_rule_does_not_match() -> None:
+    """Prefix-only hits must not inherit exact strength from another mapping for the same tag."""
+    config = FeatureWorkflowConfig.model_validate(
+        {
+            "version": 1,
+            "features": {"nightly_batch_settlement": {"service": "payments-api"}},
+            "endpoints": [
+                {
+                    "pattern": "/api/v1/settlement/run",
+                    "match": "exact",
+                    "tags": ["nightly_batch_settlement"],
+                    "methods": ["POST"],
+                },
+                {
+                    "pattern": "/api/v1/settlement",
+                    "match": "prefix",
+                    "tags": ["nightly_batch_settlement"],
+                },
+            ],
+        }
+    )
+
+    assert _endpoint_match_strength(
+        config,
+        "nightly_batch_settlement",
+        "/api/v1/settlement/sub",
+        http_method="GET",
+    ) == pytest.approx(0.7)
+
+    assert _endpoint_match_strength(
+        config,
+        "nightly_batch_settlement",
+        "/api/v1/settlement/run",
+        http_method="POST",
+    ) == pytest.approx(1.0)
 
 
 def test_confidence_breakdown_combined_respects_weights() -> None:
