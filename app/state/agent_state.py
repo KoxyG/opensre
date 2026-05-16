@@ -80,6 +80,10 @@ class AgentState(TypedDict, total=False):
     investigation_recommendations: list[str]
     remediation_steps: list[str]
     investigation_loop_count: int
+    # Feature/workflow hypothesis layer (issue #1441); populated in diagnose_root_cause.
+    feature_workflow_candidates: list[dict[str, Any]]
+    top_feature_workflow_candidate: dict[str, Any] | None
+    correlation_pathway: list[dict[str, Any]]
     hypotheses: list[str]
     executed_hypotheses: list[dict[str, Any]]
     evidence_entries: list[dict[str, Any]]
@@ -185,6 +189,9 @@ class AgentStateModel(StrictConfigModel):
     investigation_recommendations: list[str] = Field(default_factory=list)
     remediation_steps: list[str] = Field(default_factory=list)
     investigation_loop_count: int = 0
+    feature_workflow_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    top_feature_workflow_candidate: dict[str, Any] | None = None
+    correlation_pathway: list[dict[str, Any]] = Field(default_factory=list)
     hypotheses: list[str] = Field(default_factory=list)
     executed_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
     evidence_entries: list[dict[str, Any]] = Field(default_factory=list)

@@ -1,0 +1,19 @@
+# Issue #1441 — periodic feature/workflow synthetic acceptance scenario.
+required_feature_tag: nightly_batch_settlement
+min_confidence: 0.55
+required_keywords:
+  - nightly_batch_settlement
+  - scheduled
+required_evidence_drivers:
+  - hint:scheduled_workflow
+  - correlation_id_match
+root_cause_category: workflow_latency
+model_response: |
+  ROOT_CAUSE: The nightly batch settlement workflow exceeded latency SLO during its scheduled cron window.
+  ROOT_CAUSE_CATEGORY: workflow_latency
+
+  VALIDATED_CLAIMS:
+  - Settlement batch endpoint latency spiked during the scheduled workflow window. [evidence: grafana_metrics]
+
+  NON_VALIDATED_CLAIMS:
+  - Increasing batch parallelism may reduce wall-clock time if worker capacity allows.

@@ -93,8 +93,41 @@ _ALERT_SOURCE_TO_TOOL_SOURCES: dict[str, list[str]] = {
 _SECONDARY_SOURCES = {"knowledge", "openclaw", "google_docs"}
 
 
-def build_system_prompt(_state: dict[str, Any]) -> str:
-    return _INVESTIGATION_SYSTEM
+def _feature_workflow_section(state: dict[str, Any]) -> str:
+    top = state.get("top_feature_workflow_candidate")
+    if not isinstance(top, dict) or not top.get("feature_tag"):
+        return ""
+
+    tag = str(top["feature_tag"])
+    service = top.get("service")
+    confidence = float(top.get("confidence", 0.0))
+    breakdown = top.get("confidence_breakdown") or {}
+    drivers = top.get("evidence_drivers") or []
+    rationale = top.get("rationale") or []
+
+    lines = [
+        "",
+        "## Feature/workflow hypothesis (pre-scored)",
+        f"- Top candidate: **{tag}**"
+        + (f" (service: {service})" if service else "")
+        + f" — confidence {confidence:.0%}",
+        (
+            "- Breakdown: "
+            f"correlation={breakdown.get('correlation', 0):.2f}, "
+            f"topology={breakdown.get('topology', 0):.2f}, "
+            f"feature/workflow={breakdown.get('feature_workflow', 0):.2f}"
+        ),
+    ]
+    if drivers:
+        lines.append(f"- Evidence drivers: {', '.join(str(d) for d in drivers[:8])}")
+    if rationale:
+        lines.append(f"- Rationale: {rationale[0]}")
+    lines.append("- Prefer this label when evidence supports it; otherwise explain why not.")
+    return "\n".join(lines)
+
+
+def build_system_prompt(state: dict[str, Any]) -> str:
+    return _INVESTIGATION_SYSTEM + _feature_workflow_section(state)
 
 
 def format_alert_context(state: dict[str, Any]) -> str:

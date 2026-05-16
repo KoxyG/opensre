@@ -127,6 +127,10 @@ test-rca:
 test-synthetic:
 	$(PYTHON) -m pytest -m synthetic -v tests/synthetic/
 
+# Run feature/workflow synthetic scenario suite (deterministic gates, no LLM)
+test-feature-workflow-synthetic:
+	$(PYTHON) -m tests.synthetic.feature_workflow.run_suite $(if $(SCENARIO),--scenario $(SCENARIO),)
+
 # Run synthetic RDS PostgreSQL RCA benchmark suite via the CLI runner (supports --json, --scenario)
 test-rds-synthetic:
 	$(PYTHON) -m tests.synthetic.rds_postgres.run_suite $(if $(SCENARIO),--scenario $(SCENARIO),)

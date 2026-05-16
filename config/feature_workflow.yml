@@ -1,0 +1,27 @@
+# Feature/workflow mapping for RCA hypothesis ranking (issue #1441).
+# Override path: OPENSRE_FEATURE_WORKFLOW_CONFIG=/path/to/feature_workflow.yml
+
+version: 1
+
+features:
+  nightly_batch_settlement:
+    service: payments-api
+    description: Scheduled nightly settlement batch workflow
+  settlement_api:
+    service: payments-api
+    description: On-demand settlement HTTP API
+
+endpoints:
+  - pattern: /api/v1/settlement/run
+    match: exact
+    tags: [nightly_batch_settlement]
+    methods: [POST]
+  - pattern: /api/v1/settlement
+    match: prefix
+    tags: [settlement_api, nightly_batch_settlement]
+
+operator_hints:
+  - tag: nightly_batch_settlement
+    kind: scheduled_workflow
+    weight: 0.15
+    note: Cron-driven nightly job; prefer when alert aligns with schedule window

@@ -1,0 +1,4 @@
+scenario_id: 004-periodic-workflow
+failure_mode: periodic_workflow
+severity: high
+description: Scheduled settlement batch workflow exceeded SLO during cron window

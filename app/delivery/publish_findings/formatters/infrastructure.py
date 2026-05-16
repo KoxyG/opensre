@@ -212,6 +212,33 @@ def extract_infrastructure_assets(ctx: ReportContext) -> dict[str, Any]:
     return assets
 
 
+def _feature_workflow_trace_lines(ctx: ReportContext) -> list[str]:
+    """Format feature/workflow hypothesis steps with confidence and drivers."""
+    top = ctx.get("top_feature_workflow_candidate")
+    if not isinstance(top, dict) or not top.get("feature_tag"):
+        return []
+
+    tag = str(top["feature_tag"])
+    try:
+        confidence = float(top.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    drivers = top.get("evidence_drivers") or []
+    driver_text = ", ".join(str(driver) for driver in drivers[:6])
+    if len(drivers) > 6:
+        driver_text = f"{driver_text}, +{len(drivers) - 6} more"
+
+    line = f"Feature/workflow hypothesis: {tag} (confidence {confidence:.0%})"
+    if driver_text:
+        line += f" — driven by: {driver_text}"
+
+    rationale = top.get("rationale") or []
+    if isinstance(rationale, list) and rationale:
+        line += f". {rationale[0]}"
+
+    return [line]
+
+
 def build_investigation_trace(ctx: ReportContext) -> list[str]:
     """Build the investigation trace showing what was discovered.
 
@@ -308,6 +335,10 @@ def build_investigation_trace(ctx: ReportContext) -> list[str]:
     # Step 6: Root cause evidence
     if evidence.get("lambda_function"):
         trace_steps.append(f"{step_num}. Lambda configuration analyzed")
+        step_num += 1
+
+    for line in _feature_workflow_trace_lines(ctx):
+        trace_steps.append(f"{step_num}. {line}")
         step_num += 1
 
     return trace_steps

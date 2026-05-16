@@ -1,0 +1,25 @@
+{
+  "title": "[synthetic] Periodic settlement workflow latency",
+  "state": "alerting",
+  "alert_source": "grafana",
+  "commonLabels": {
+    "alertname": "SettlementBatchLatencyHigh",
+    "severity": "high",
+    "pipeline_name": "payments-api",
+    "service": "payments-api"
+  },
+  "commonAnnotations": {
+    "summary": "Nightly batch settlement run exceeded latency SLO during the scheduled cron window.",
+    "endpoint": "/api/v1/settlement/run",
+    "http_method": "POST",
+    "correlation_id": "batch-settlement-20260418",
+    "workflow": "nightly_batch_settlement",
+    "operator_hints": [
+      {
+        "tag": "nightly_batch_settlement",
+        "kind": "scheduled_workflow"
+      }
+    ],
+    "context_sources": "grafana,cloudwatch"
+  }
+}

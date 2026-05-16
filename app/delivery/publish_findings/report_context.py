@@ -46,6 +46,9 @@ class ReportContext(TypedDict, total=False):
     validated_claims: list[dict]
     non_validated_claims: list[dict]
     validity_score: float
+    feature_workflow_candidates: list[dict[str, Any]]
+    top_feature_workflow_candidate: dict[str, Any] | None
+    correlation_pathway: list[dict[str, Any]]
     investigation_recommendations: list[str]
     remediation_steps: list[str]
     correlation: dict[str, Any]
@@ -918,6 +921,9 @@ def build_report_context(state: InvestigationState) -> ReportContext:
         "validated_claims": validated_claims,
         "non_validated_claims": non_validated_claims,
         "validity_score": state.get("validity_score", 0.0),
+        "feature_workflow_candidates": state.get("feature_workflow_candidates", []),
+        "top_feature_workflow_candidate": state.get("top_feature_workflow_candidate"),
+        "correlation_pathway": state.get("correlation_pathway", []),
         "investigation_recommendations": state.get("investigation_recommendations", []),
         "remediation_steps": state.get("remediation_steps", []),
         "correlation": state.get("correlation", {}),

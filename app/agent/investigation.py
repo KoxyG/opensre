@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from app.agent.feature_workflow import resolve_feature_workflow_fields
 from app.agent.prompt import build_system_prompt, format_alert_context
 from app.agent.result import InvestigationResult, parse_diagnosis
 from app.cli.support.output import debug_print, get_tracker
@@ -97,6 +98,9 @@ class ConnectedInvestigationAgent:
         tool_context = _build_connected_tool_context(resolved, tools)
         state["available_sources"] = tool_context["available_sources"]
         state["available_action_names"] = tool_context["available_action_names"]
+
+        feature_workflow_fields = resolve_feature_workflow_fields(state)  # type: ignore[arg-type]
+        state.update(feature_workflow_fields)
 
         if not tools:
             logger.warning("No tools available for investigation")
@@ -229,6 +233,7 @@ class ConnectedInvestigationAgent:
         updates = _result_to_state(result)
         updates["executed_hypotheses"] = executed_hypotheses
         updates.update(tool_context)
+        updates.update(feature_workflow_fields)
         return updates
 
 

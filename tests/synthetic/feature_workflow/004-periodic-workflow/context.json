@@ -1,0 +1,5 @@
+{
+  "service": "payments-api",
+  "correlation_id": "batch-settlement-20260418",
+  "endpoint": "/api/v1/settlement/run"
+}
