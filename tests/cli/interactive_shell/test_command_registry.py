@@ -19,7 +19,7 @@ from app.cli.interactive_shell.command_registry.session_cmds import (
     _VERBOSE_FIRST_ARGS,
 )
 from app.cli.interactive_shell.commands import SLASH_COMMANDS as COMMANDS_EXPORT
-from app.cli.interactive_shell.session import ReplSession
+from app.cli.interactive_shell.runtime.session import ReplSession
 
 
 def test_commands_shim_reexports_same_registry() -> None:
@@ -42,6 +42,9 @@ def test_slash_registry_includes_modular_commands() -> None:
         "/integrations",
         "/investigate",
         "/tasks",
+        "/watch",
+        "/watches",
+        "/unwatch",
         "/health",
     ):
         assert name in SLASH_COMMANDS

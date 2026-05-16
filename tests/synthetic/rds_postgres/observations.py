@@ -13,38 +13,20 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# Re-exported for backward compatibility — canonical definitions live in trajectory_policy.py
+from tests.synthetic.rds_postgres.trajectory_policy import (
+    TrajectoryMetrics,
+    TrajectoryPolicy,
+    TrajectoryPolicyResult,
+    evaluate_trajectory_policy,
+)
 
-@dataclass(frozen=True)
-class TrajectoryMetrics:
-    flat_actions: list[str]
-    actions_per_loop: list[int]
-    strict_match: bool | None
-    lcs_ratio: float | None
-    edit_distance: int | None
-    coverage: float | None
-    extra_actions: list[str]
-    missing_actions: list[str]
-    redundancy_count: int
-    loops_used: int
-    max_loops: int | None
-    loop_calibration_ok: bool | None
-    failed_action_count: int
-
-
-@dataclass(frozen=True)
-class TrajectoryPolicy:
-    matching: str
-    max_edit_distance: int | None = None
-    max_extra_actions: int | None = None
-    max_redundancy: int | None = None
-    max_loops: int | None = None
-
-
-@dataclass(frozen=True)
-class TrajectoryPolicyResult:
-    passed: bool
-    matching: str
-    violations: list[str]
+__all__ = [
+    "TrajectoryMetrics",
+    "TrajectoryPolicy",
+    "TrajectoryPolicyResult",
+    "evaluate_trajectory_policy",
+]
 
 
 @dataclass(frozen=True)
@@ -63,6 +45,7 @@ class RunObservation:
     trajectory_policy_version: str
     reasoning: dict[str, Any] | None
     reasoning_status: str
+    correlation: dict[str, Any] | None
     observed_evidence_sources: list[str]
     required_evidence_sources: list[str]
     missing_required_evidence_sources: list[str]
@@ -183,6 +166,7 @@ def _canonical_report_payload(
     evaluated_golden_actions: list[str],
     trajectory_policy: TrajectoryPolicyResult | None,
     evidence_source_coverage: dict[str, Any],
+    correlation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     policy_payload: dict[str, Any] | None = None
     if trajectory_policy is not None:
@@ -216,6 +200,12 @@ def _canonical_report_payload(
             "source_presence": dict(evidence_source_coverage["source_presence"]),
             "required_coverage": evidence_source_coverage["required_coverage"],
             "available_coverage": evidence_source_coverage["available_coverage"],
+        },
+        "correlation": correlation
+        if correlation is not None
+        else {
+            "correlated_signals": [],
+            "most_likely_causal_drivers": [],
         },
         "trajectory": {
             "golden": list(evaluated_golden_actions),
@@ -275,46 +265,6 @@ def _score_with_process_metrics(
 ) -> dict[str, Any]:
     """Return score payload with process metrics first for readability."""
     return {"process_metrics": _process_metrics_summary(trajectory), **score}
-
-
-def evaluate_trajectory_policy(
-    metrics: TrajectoryMetrics,
-    golden_actions: list[str],
-    policy: TrajectoryPolicy | None,
-) -> TrajectoryPolicyResult | None:
-    if not golden_actions or policy is None:
-        return None
-
-    violations: list[str] = []
-    matching = policy.matching
-
-    if matching == "strict" and metrics.strict_match is not True:
-        violations.append("strict sequence mismatch")
-    elif matching == "lcs" and metrics.lcs_ratio != 1.0:
-        violations.append(f"lcs_ratio={_fmt_ratio(metrics.lcs_ratio)} < 1.00")
-    elif matching == "set" and metrics.missing_actions:
-        violations.append(f"missing actions: {', '.join(metrics.missing_actions)}")
-
-    if (
-        policy.max_edit_distance is not None
-        and metrics.edit_distance is not None
-        and metrics.edit_distance > policy.max_edit_distance
-    ):
-        violations.append(f"edit_distance={metrics.edit_distance} > {policy.max_edit_distance}")
-    if policy.max_extra_actions is not None:
-        extra_count = len(metrics.extra_actions)
-        if extra_count > policy.max_extra_actions:
-            violations.append(f"extra_actions={extra_count} > {policy.max_extra_actions}")
-    if policy.max_redundancy is not None and metrics.redundancy_count > policy.max_redundancy:
-        violations.append(f"redundancy_count={metrics.redundancy_count} > {policy.max_redundancy}")
-    if policy.max_loops is not None and metrics.loops_used > policy.max_loops:
-        violations.append(f"loops_used={metrics.loops_used} > {policy.max_loops}")
-
-    return TrajectoryPolicyResult(
-        passed=not violations,
-        matching=matching,
-        violations=violations,
-    )
 
 
 def compute_trajectory_metrics(
@@ -381,6 +331,7 @@ def build_observation(
     required_evidence_sources: list[str],
     started_at: datetime,
     wall_time_s: float,
+    correlation: dict[str, Any] | None = None,
 ) -> RunObservation:
     evidence = final_state.get("evidence") or {}
     evidence_source_coverage = _source_aware_evidence_coverage(
@@ -408,6 +359,7 @@ def build_observation(
         trajectory_policy_version="default_v1",
         reasoning=reasoning,
         reasoning_status="captured" if reasoning is not None else "not_captured",
+        correlation=correlation,
         observed_evidence_sources=observed_sources,
         required_evidence_sources=required_sources,
         missing_required_evidence_sources=missing_required_sources,
@@ -418,18 +370,32 @@ def build_observation(
             evaluated_golden_actions=evaluated_golden_actions,
             trajectory_policy=trajectory_policy,
             evidence_source_coverage=evidence_source_coverage,
+            correlation=correlation,
         ),
         final_state_digest=final_state_digest(final_state),
     )
+
+
+def _canonical_artifact_name(canonical_report_payload: dict[str, Any], scenario_id: str) -> str:
+    """Derive a 12-hex-char content-addressed filename from the canonical payload + scenario id.
+
+    Using the canonical payload (not the full observation) means the filename is
+    stable across re-runs that produce the same scoring output, making ``git diff``
+    against ``_baseline/`` noise-free.
+    """
+    content = json.dumps(canonical_report_payload, sort_keys=True, separators=(",", ":"))
+    digest = sha256((content + scenario_id).encode("utf-8")).hexdigest()[:12]
+    return f"{digest}.json"
 
 
 def write_observation(observation: RunObservation, observations_dir: Path) -> Path:
     scenario_dir = observations_dir / observation.scenario_id
     scenario_dir.mkdir(parents=True, exist_ok=True)
 
-    status = "pass" if bool(observation.score.get("passed")) else "fail"
-    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
-    target = scenario_dir / f"{stamp}__{status}.json"
+    canonical_name = _canonical_artifact_name(
+        observation.canonical_report_payload, observation.scenario_id
+    )
+    target = scenario_dir / canonical_name
 
     payload = _drop_none_fields(asdict(observation))
     payload["observation_path"] = str(target.relative_to(observations_dir))

@@ -6,6 +6,8 @@ import os
 from collections.abc import Iterator
 from unittest.mock import patch
 
+import pytest
+
 from app.remote.renderer import StreamRenderer, _canonical_node_name
 from app.remote.stream import StreamEvent
 
@@ -76,7 +78,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
     yield _make_event(
         "events",
         "extract_alert",
-        {"name": "extract_alert", "data": {}, "metadata": {"langgraph_node": "extract_alert"}},
+        {"name": "extract_alert", "data": {}, "metadata": {"pipeline_node": "extract_alert"}},
         kind="on_chain_start",
         tags=["graph:step:1"],
     )
@@ -86,7 +88,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
         {
             "name": "extract_alert",
             "data": {"output": {"alert_name": "test", "severity": "high"}},
-            "metadata": {"langgraph_node": "extract_alert"},
+            "metadata": {"pipeline_node": "extract_alert"},
         },
         kind="on_chain_end",
         tags=["graph:step:1"],
@@ -95,7 +97,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
     yield _make_event(
         "events",
         "investigate",
-        {"name": "investigate", "data": {}, "metadata": {"langgraph_node": "investigate"}},
+        {"name": "investigate", "data": {}, "metadata": {"pipeline_node": "investigate"}},
         kind="on_chain_start",
         tags=["graph:step:3"],
     )
@@ -105,7 +107,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
         {
             "name": "query_datadog_logs",
             "data": {"input": {"query": "error"}},
-            "metadata": {"langgraph_node": "investigate"},
+            "metadata": {"pipeline_node": "investigate"},
         },
         kind="on_tool_start",
         tags=[],
@@ -116,7 +118,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
         {
             "name": "query_datadog_logs",
             "data": {"output": "42 entries"},
-            "metadata": {"langgraph_node": "investigate"},
+            "metadata": {"pipeline_node": "investigate"},
         },
         kind="on_tool_end",
         tags=[],
@@ -127,7 +129,7 @@ def _events_mode_stream() -> Iterator[StreamEvent]:
         {
             "name": "investigate",
             "data": {"output": {"root_cause": "Schema error"}},
-            "metadata": {"langgraph_node": "investigate"},
+            "metadata": {"pipeline_node": "investigate"},
         },
         kind="on_chain_end",
         tags=["graph:step:3"],
@@ -218,6 +220,18 @@ class TestStreamRendererUpdatesMode:
         assert msg is not None
         assert "92%" in msg
 
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_node_message_for_diagnose_skips_non_numeric_validity(self) -> None:
+        renderer = StreamRenderer()
+        renderer._final_state = {"validity_score": "0.9"}
+        assert renderer._build_node_message("diagnose_root_cause") is None
+
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_node_message_for_diagnose_skips_non_finite_validity(self) -> None:
+        renderer = StreamRenderer()
+        renderer._final_state = {"validity_score": float("nan")}
+        assert renderer._build_node_message("diagnose_root_cause") is None
+
 
 class TestStreamRendererEventsMode:
     """Tests for events-mode rendering (fine-grained tool/LLM events)."""
@@ -245,6 +259,97 @@ class TestStreamRendererEventsMode:
         renderer = StreamRenderer()
         renderer.render_stream(_events_mode_stream())
         assert renderer.events_received == 8
+
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_tool_details_hidden_by_default_and_grouped_inline(self, capfd) -> None:
+        def tool_trace_events() -> Iterator[StreamEvent]:
+            yield _make_event(
+                "events",
+                "investigation_agent",
+                {
+                    "id": "call-1",
+                    "name": "query_grafana_logs",
+                    "input": {
+                        "service_name": "checkout-api",
+                        "grafana_api_key": "secret-key",
+                    },
+                },
+                kind="on_tool_start",
+            )
+            yield _make_event(
+                "events",
+                "investigation_agent",
+                {
+                    "id": "call-1",
+                    "name": "query_grafana_logs",
+                    "output": {"available": True, "logs": [{"message": "boom"}]},
+                },
+                kind="on_tool_end",
+            )
+
+        renderer = StreamRenderer()
+        renderer.render_stream(tool_trace_events())
+
+        out, _ = capfd.readouterr()
+        assert "Input:" not in out
+        assert "Output:" not in out
+        assert "checkout-api" not in out
+        assert "boom" not in out
+        assert "secret-key" not in out
+        assert renderer._format_tool_summary() == "Grafana: Loki"
+
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_tool_detail_toggle_prints_redacted_input_and_output(self, capfd) -> None:
+        def tool_trace_events() -> Iterator[StreamEvent]:
+            yield _make_event(
+                "events",
+                "investigation_agent",
+                {
+                    "id": "call-1",
+                    "name": "query_grafana_logs",
+                    "input": {
+                        "service_name": "checkout-api",
+                        "grafana_api_key": "secret-key",
+                    },
+                },
+                kind="on_tool_start",
+            )
+            yield _make_event(
+                "events",
+                "investigation_agent",
+                {
+                    "id": "call-1",
+                    "name": "query_grafana_logs",
+                    "output": {"available": True, "logs": [{"message": "boom"}]},
+                },
+                kind="on_tool_end",
+            )
+
+        renderer = StreamRenderer()
+        renderer._toggle_tool_details()
+        renderer.render_stream(tool_trace_events())
+
+        out, _ = capfd.readouterr()
+        assert "Tool details shown" in out
+        assert "Input:" in out
+        assert "Output:" in out
+        assert "checkout-api" in out
+        assert "boom" in out
+        assert "secret-key" not in out
+        assert "[redacted]" in out
+
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_tool_summary_groups_repeated_tools_by_source(self) -> None:
+        renderer = StreamRenderer()
+        for tool_name in (
+            "query_grafana_alert_rules",
+            "query_grafana_metrics",
+            "query_grafana_metrics",
+            "query_grafana_logs",
+        ):
+            renderer._record_tool_summary(tool_name)
+
+        assert renderer._format_tool_summary() == "Grafana: alerts, Mimir x2, Loki"
 
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
     def test_ignores_events_without_node(self) -> None:
@@ -289,7 +394,7 @@ class TestStreamRendererEventsMode:
             "investigate",
             {"name": "RunnableSequence"},
             kind="on_chain_start",
-            tags=["langsmith:hidden"],
+            tags=["tracing:hidden"],
         )
         assert StreamRenderer._is_graph_node_event(evt) is False
 
@@ -348,6 +453,35 @@ class TestStreamRendererCleanupOnException:
             "accumulated state from before the failure must be retained"
         )
 
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
+    def test_print_report_skipped_on_keyboard_interrupt(self) -> None:
+        """_print_report must NOT run when the user presses Ctrl+C."""
+
+        def stream_raises_keyboard_interrupt() -> Iterator[StreamEvent]:
+            yield _make_event("metadata", data={"run_id": "r-ki"})
+            yield _make_event(
+                "updates",
+                "extract_alert",
+                {"extract_alert": {"alert_name": "interrupted-alert"}},
+            )
+            raise KeyboardInterrupt
+
+        renderer = StreamRenderer()
+        print_report_calls: list[None] = []
+        finish_calls: list[None] = []
+
+        renderer._print_report = lambda: print_report_calls.append(None)  # type: ignore[method-assign]
+        renderer._finish_active_node = lambda: finish_calls.append(None)  # type: ignore[method-assign]
+
+        with pytest.raises(KeyboardInterrupt):
+            renderer.render_stream(stream_raises_keyboard_interrupt())
+
+        assert finish_calls, "spinner cleanup must run on Ctrl+C"
+        assert not print_report_calls, (
+            "_print_report() must be skipped when the user interrupts the stream"
+        )
+        assert renderer.final_state.get("alert_name") == "interrupted-alert"
+
 
 def _diagnose_streaming_events() -> Iterator[StreamEvent]:
     """Simulate the diagnose node emitting token deltas before chain end."""
@@ -355,7 +489,7 @@ def _diagnose_streaming_events() -> Iterator[StreamEvent]:
     yield _make_event(
         "events",
         "diagnose",
-        {"name": "diagnose", "data": {}, "metadata": {"langgraph_node": "diagnose"}},
+        {"name": "diagnose", "data": {}, "metadata": {"pipeline_node": "diagnose"}},
         kind="on_chain_start",
         tags=["graph:step:1"],
     )
@@ -365,7 +499,7 @@ def _diagnose_streaming_events() -> Iterator[StreamEvent]:
         {
             "name": "diagnose",
             "data": {"chunk": {"content": "OpenSRE "}},
-            "metadata": {"langgraph_node": "diagnose"},
+            "metadata": {"pipeline_node": "diagnose"},
         },
         kind="on_chat_model_stream",
         tags=[],
@@ -376,7 +510,7 @@ def _diagnose_streaming_events() -> Iterator[StreamEvent]:
         {
             "name": "diagnose",
             "data": {"chunk": {"content": "identified the schema mismatch."}},
-            "metadata": {"langgraph_node": "diagnose"},
+            "metadata": {"pipeline_node": "diagnose"},
         },
         kind="on_chat_model_stream",
         tags=[],
@@ -387,7 +521,7 @@ def _diagnose_streaming_events() -> Iterator[StreamEvent]:
         {
             "name": "diagnose",
             "data": {"output": {"root_cause": "Schema mismatch", "validity_score": 0.85}},
-            "metadata": {"langgraph_node": "diagnose"},
+            "metadata": {"pipeline_node": "diagnose"},
         },
         kind="on_chain_end",
         tags=["graph:step:1"],
@@ -455,18 +589,18 @@ class TestStreamRendererDiagnoseStreaming:
 
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
     def test_root_cause_section_printed_when_diagnose_did_not_stream(self, capfd) -> None:
-        """Updates-mode (no events stream) keeps the Root Cause section as before."""
+        """Updates-mode renders the report via the terminal renderer."""
         renderer = StreamRenderer()
         renderer.render_stream(_investigation_events())
 
         out, _ = capfd.readouterr()
-        # Updates mode never populates the diagnose buffer, so the section prints.
-        assert "Root Cause" in out
-        assert "Schema mismatch" in out
+        # The terminal renderer now outputs the report content (not a labelled
+        # Root Cause section) — "Investigation complete." comes from the publish event.
+        assert "Investigation complete" in out
 
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "text"})
     def test_diagnose_handles_anthropic_content_block_lists(self, capfd) -> None:
-        """langchain-anthropic emits AIMessageChunk.content as a list of blocks.
+        """Anthropic-style adapters emit AIMessageChunk.content as a list of blocks.
 
         Each block can be a dict ``{"type": "text", "text": "..."}`` or an
         object with ``.text``. The renderer must flatten both shapes; calling
@@ -484,18 +618,18 @@ class TestStreamRendererDiagnoseStreaming:
             yield _make_event(
                 "events",
                 "diagnose",
-                {"name": "diagnose", "data": {}, "metadata": {"langgraph_node": "diagnose"}},
+                {"name": "diagnose", "data": {}, "metadata": {"pipeline_node": "diagnose"}},
                 kind="on_chain_start",
                 tags=["graph:step:1"],
             )
-            # Object-form block (langchain-anthropic typical shape).
+            # Object-form block (Anthropic-style typical shape).
             yield _make_event(
                 "events",
                 "diagnose",
                 {
                     "name": "diagnose",
                     "data": {"chunk": {"content": [_AnthropicTextBlock("Schema ")]}},
-                    "metadata": {"langgraph_node": "diagnose"},
+                    "metadata": {"pipeline_node": "diagnose"},
                 },
                 kind="on_chat_model_stream",
                 tags=[],
@@ -509,7 +643,7 @@ class TestStreamRendererDiagnoseStreaming:
                     "data": {
                         "chunk": {"content": [{"type": "text", "text": "mismatch detected."}]}
                     },
-                    "metadata": {"langgraph_node": "diagnose"},
+                    "metadata": {"pipeline_node": "diagnose"},
                 },
                 kind="on_chat_model_stream",
                 tags=[],
@@ -523,7 +657,7 @@ class TestStreamRendererDiagnoseStreaming:
                     "data": {
                         "chunk": {"content": [{"type": "tool_use", "name": "search", "input": {}}]}
                     },
-                    "metadata": {"langgraph_node": "diagnose"},
+                    "metadata": {"pipeline_node": "diagnose"},
                 },
                 kind="on_chat_model_stream",
                 tags=[],
@@ -534,7 +668,7 @@ class TestStreamRendererDiagnoseStreaming:
                 {
                     "name": "diagnose",
                     "data": {"output": {"root_cause": "Schema mismatch"}},
-                    "metadata": {"langgraph_node": "diagnose"},
+                    "metadata": {"pipeline_node": "diagnose"},
                 },
                 kind="on_chain_end",
                 tags=["graph:step:1"],
@@ -560,7 +694,7 @@ class TestStreamRendererDiagnoseStreaming:
             yield _make_event(
                 "events",
                 "diagnose",
-                {"name": "diagnose", "data": {}, "metadata": {"langgraph_node": "diagnose"}},
+                {"name": "diagnose", "data": {}, "metadata": {"pipeline_node": "diagnose"}},
                 kind="on_chain_start",
                 tags=["graph:step:1"],
             )
@@ -570,7 +704,7 @@ class TestStreamRendererDiagnoseStreaming:
                 {
                     "name": "diagnose",
                     "data": {"chunk": {"content": "partial reasoning..."}},
-                    "metadata": {"langgraph_node": "diagnose"},
+                    "metadata": {"pipeline_node": "diagnose"},
                 },
                 kind="on_chat_model_stream",
                 tags=[],
@@ -589,6 +723,282 @@ class TestStreamRendererDiagnoseStreaming:
         # _active_node.
         assert renderer._diagnose._live is None
         assert renderer._active_node is None
+
+
+class TestStreamRendererFocusedUXAndParsing:
+    """Focused tests for plan preview and deterministic report parsing."""
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_plan_preview_printed_exactly_once(self, _mock_display, _mock_live) -> None:
+        """The plan preview panel is printed exactly once when the plan_actions node completes."""
+        renderer = StreamRenderer()
+        renderer._final_state = {"planned_actions": ["check_logs", "query_metrics"]}
+        renderer._active_node = "plan_actions"
+
+        renderer._finish_active_node()
+        assert renderer._plan_preview_printed is True
+
+        renderer._plan_preview_printed = True
+        renderer._active_node = "plan_actions"
+        renderer._finish_active_node()
+        assert renderer._plan_preview_printed is True
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_with_structured_sections(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Report content is rendered via the terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Database connection pool saturated",
+            "validity_score": 0.95,
+            "slack_message": (
+                "### Supporting Evidence\n"
+                "• Active connections reached 100 max limit\n"
+                "• Thread pool starvation observed in logs\n"
+                "\n"
+                "### Next Actions\n"
+                "• Scale database connections to 200\n"
+                "• Restart connection pool gracefully\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+
+        assert "Active connections" in out
+        assert "Scale database connections to 200" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_with_numbered_lists(self, _mock_display, _mock_live, capfd) -> None:
+        """Report content with numbered lists is rendered via the terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Database connection pool saturated",
+            "validity_score": 0.95,
+            "slack_message": (
+                "### Supporting Evidence\n"
+                "1. Active connections reached 100 max limit\n"
+                "2) Thread pool starvation observed in logs\n"
+                "\n"
+                "### Next Actions\n"
+                "1. Scale database connections to 200\n"
+                "2) Restart connection pool gracefully\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+
+        assert "Active connections" in out
+        assert "Scale database connections to 200" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_fallback_to_verbs_if_no_section(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Report content with bullet points is passed through to the terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Deadlock in database",
+            "validity_score": 0.88,
+            "slack_message": (
+                "The system experienced a major deadlock.\n"
+                "• Check transaction isolation levels.\n"
+                "• Restart the backend container.\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+
+        assert "Check transaction isolation levels" in out
+        assert "Restart the backend container" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_ignores_prose_evidence(self, _mock_display, _mock_live, capfd) -> None:
+        """Report content including evidence items is rendered via the terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Database connection pool saturated",
+            "validity_score": 0.95,
+            "slack_message": (
+                "There is no evidence of database hardware failure.\n"
+                "### Supporting Evidence\n"
+                "• Saturated pool connections count is 100\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Saturated pool connections count" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_mid_sentence_prose_not_misclassified(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Report content with prose and evidence is rendered via the terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Database connection pool saturated",
+            "validity_score": 0.95,
+            "slack_message": (
+                "There is no supporting evidence of DB hardware failure\n"
+                "Investigating root cause further to be absolutely sure\n"
+                "Skip next steps for now until confirmed\n"
+                "### Supporting Evidence\n"
+                "• Saturated pool connections count is 100\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Saturated pool connections count" in out
+        assert "There is no supporting evidence of DB hardware failure" in out
+        assert "Investigating root cause further" in out
+        assert "Skip next steps for now" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_verb_fallback_ignores_consumed_lines(self, _mock_display, _mock_live, capfd) -> None:
+        """Verb-fallback does not pick up diagnostic prose that was already consumed by another section."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "High memory consumption",
+            "validity_score": 0.90,
+            "report": (
+                "### Supporting Evidence\n• We run the check on CPU and confirm it is stable.\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Next Actions" not in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_rich_rca_includes_parsed_report_root_cause_body(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Lines under a report \"Root Cause\" section are shown in the RCA output (rich)."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Connection pool exhausted",
+            "validity_score": 0.9,
+            "slack_message": (
+                "# Root Cause\n"
+                "Connection pool exhausted\n"
+                "• Stale transactions hold connections open.\n"
+                "• Idle timeout was set too high for burst traffic.\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Connection pool exhausted" in out
+        assert "Stale transactions" in out
+        assert "Idle timeout" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parses_markdown_hash_and_emphasis_headers(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Report content is rendered through terminal renderer."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Incident summary line",
+            "validity_score": 0.88,
+            "report": (
+                "*Non-Validated Claims (Inferred):*\n"
+                "Insufficient evidence gathered yet.\n"
+                "## Recommended Actions\n"
+                "- Enable debug logging for the workload\n"
+                "*Cited Evidence:*\n"
+                "- Queries: synthetic lookup\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Insufficient evidence gathered" in out
+        assert "synthetic lookup" in out.lower()
+        assert "Enable debug logging" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_root_cause_verbs_do_not_promote_to_next_actions(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Action verbs under Root Cause belong in RCA detail, never verb-fallback Next Actions."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Connection pool exhaustion",
+            "validity_score": 0.9,
+            "report": (
+                "# Root Cause\n"
+                "• Review the pool settings before scaling.\n"
+                "• Check idle timeout versus burst traffic.\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Next Actions" not in out
+        assert "Review the pool settings" in out
+        assert "idle timeout" in out.lower()
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_rich_rca_confidence_invalid_score_shows_na(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "Incident summary",
+            "validity_score": float("nan"),
+            "slack_message": "Incident summary\nNo root cause found.",
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Incident summary" in out
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_report_parsing_mid_list_transition_guard(
+        self, _mock_display, _mock_live, capfd
+    ) -> None:
+        """Section keywords inside a bullet item do not cause mid-list section transitions."""
+        renderer = StreamRenderer()
+        renderer._final_state = {
+            "root_cause": "High memory consumption",
+            "validity_score": 0.90,
+            "report": (
+                "### Supporting Evidence\n"
+                "• The evidence suggests memory leak in container.\n"
+                "• Check the heap dump next.\n"
+            ),
+        }
+        renderer._print_report()
+        out, _ = capfd.readouterr()
+        assert "Supporting Evidence" in out
+        assert "The evidence suggests memory leak" in out
+
+    def test_strip_outer_quotes_does_not_fire_on_linux(self) -> None:
+        """Windows-only outer quote normalization does not alter POSIX shlex tokens."""
+        from app.cli.interactive_shell.shell.policy import parse_shell_command
+
+        parsed = parse_shell_command('run "cat /tmp/file.txt"', is_windows=False)
+        assert parsed.argv == ["run", "cat /tmp/file.txt"]
 
 
 class TestStreamRendererDiagnoseThrottle:
@@ -610,7 +1020,7 @@ class TestStreamRendererDiagnoseThrottle:
             {
                 "name": "diagnose",
                 "data": {"chunk": {"content": content}},
-                "metadata": {"langgraph_node": "diagnose"},
+                "metadata": {"pipeline_node": "diagnose"},
             },
             kind="on_chat_model_stream",
             tags=[],
@@ -621,7 +1031,7 @@ class TestStreamRendererDiagnoseThrottle:
         return _make_event(
             "events",
             "diagnose",
-            {"name": "diagnose", "data": {}, "metadata": {"langgraph_node": "diagnose"}},
+            {"name": "diagnose", "data": {}, "metadata": {"pipeline_node": "diagnose"}},
             kind="on_chain_start",
             tags=["graph:step:1"],
         )
@@ -634,7 +1044,7 @@ class TestStreamRendererDiagnoseThrottle:
             {
                 "name": "diagnose",
                 "data": {"output": {"root_cause": "x"}},
-                "metadata": {"langgraph_node": "diagnose"},
+                "metadata": {"pipeline_node": "diagnose"},
             },
             kind="on_chain_end",
             tags=["graph:step:1"],
@@ -660,8 +1070,12 @@ class TestStreamRendererDiagnoseThrottle:
         monkeypatch.setattr(renderer_module, "Markdown", _SpyMarkdown)
         return fake_time, parse_count
 
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
-    def test_chunks_in_one_window_collapse_to_a_single_final_flush(self, monkeypatch) -> None:
+    def test_chunks_in_one_window_collapse_to_a_single_final_flush(
+        self, _mock_display, _mock_live, monkeypatch
+    ) -> None:
         """100 chunks while the clock is stuck → exactly one Markdown parse."""
         fake_time, parse_count = self._install_clock_and_spy(monkeypatch)
         # Force rich mode so the Live region opens and the throttle gates
@@ -688,8 +1102,12 @@ class TestStreamRendererDiagnoseThrottle:
         # silence unused-var while keeping the fixture wired.
         assert fake_time[0] == 0.0
 
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
-    def test_chunks_across_multiple_windows_render_periodically(self, monkeypatch) -> None:
+    def test_chunks_across_multiple_windows_render_periodically(
+        self, _mock_display, _mock_live, monkeypatch
+    ) -> None:
         """Chunks spaced past the throttle interval render multiple times."""
         from app.remote import renderer as renderer_module
 
@@ -711,8 +1129,12 @@ class TestStreamRendererDiagnoseThrottle:
         # Throttle's purpose: parse count must stay << total chunks.
         assert parse_count[0] < 50
 
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
-    def test_final_flush_renders_chunks_pending_in_last_window(self, monkeypatch) -> None:
+    def test_final_flush_renders_chunks_pending_in_last_window(
+        self, _mock_display, _mock_live, monkeypatch
+    ) -> None:
         """Chunks arriving in the trailing throttle window must still appear."""
         from app.remote import renderer as renderer_module
 
@@ -734,8 +1156,12 @@ class TestStreamRendererDiagnoseThrottle:
         # Two parses: one in-loop render at "early " + one final flush.
         assert parse_count[0] == 2
 
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
     @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
-    def test_anthropic_block_chunks_throttle_correctly(self, monkeypatch) -> None:
+    def test_anthropic_block_chunks_throttle_correctly(
+        self, _mock_display, _mock_live, monkeypatch
+    ) -> None:
         """List-shaped Anthropic content blocks honor the same throttle gate."""
         fake_time, parse_count = self._install_clock_and_spy(monkeypatch)
         renderer = StreamRenderer()
@@ -754,3 +1180,116 @@ class TestStreamRendererDiagnoseThrottle:
         assert "".join(renderer._diagnose.buffer).startswith("c0 ")
         assert "c19" in "".join(renderer._diagnose.buffer)
         assert fake_time[0] == 0.0
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_diagnose_start_stops_progress_tracker_display(self, _mock_display, _mock_live) -> None:
+        """Calling _begin_diagnose safely stops the active ProgressTracker display and sets it to None."""
+        renderer = StreamRenderer()
+        # Initialize active display
+        renderer._tracker._display = renderer._tracker._display or True
+        assert renderer._tracker._display is not None
+
+        renderer._begin_diagnose("diagnose_root_cause")
+        assert renderer._tracker._display is None
+
+
+class TestStreamRendererPrintAboveRenderable:
+    """Tests for the _print_above_renderable safety mechanism.
+
+    Ensures that when the diagnose Live region is active, print_above_renderable
+    is routed through the Live console to prevent terminal corruption, and
+    otherwise falls back to the tracker.
+    """
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_print_above_renderable_routes_to_live_console_when_started(
+        self, _mock_display, _mock_live
+    ) -> None:
+        renderer = StreamRenderer()
+        renderer._begin_diagnose("diagnose_root_cause")
+
+        # Mock the active Live object's console
+        from unittest.mock import MagicMock
+
+        mock_console = MagicMock()
+        renderer._diagnose._live.console = mock_console
+        renderer._diagnose._live.is_started = True
+
+        panel = "test-panel"
+        renderer._print_above_renderable(panel)
+
+        # Should print directly via active Live console
+        mock_console.print.assert_called_once_with(panel)
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_print_above_renderable_falls_back_to_tracker_when_live_not_started(
+        self, _mock_display, _mock_live
+    ) -> None:
+        renderer = StreamRenderer()
+        # Mock tracker's print_above_renderable
+        from unittest.mock import MagicMock
+
+        mock_tracker_print = MagicMock()
+        renderer._tracker.print_above_renderable = mock_tracker_print
+
+        panel = "test-panel"
+        renderer._print_above_renderable(panel)
+
+        # Should fall back to tracker
+        mock_tracker_print.assert_called_once_with(panel)
+
+    @patch("app.remote.renderer.Live")
+    @patch("app.cli.support.output._EventLogDisplay")
+    @patch.dict(os.environ, {"TRACER_OUTPUT_FORMAT": "rich"})
+    def test_print_above_renderable_falls_back_to_console_when_tracker_stopped(
+        self, _mock_display, _mock_live
+    ) -> None:
+        from app.remote.renderer import StreamRenderer
+
+        renderer = StreamRenderer()
+
+        # Simulate tracker being stopped
+        renderer._tracker.stop()
+        assert renderer._tracker._display is None
+
+        from unittest.mock import MagicMock
+
+        mock_console = MagicMock()
+        renderer._console = mock_console
+
+        panel = "test-panel"
+        renderer._print_above_renderable(panel)
+
+        # Should fall back to internal console
+        mock_console.print.assert_called_once_with(panel)
+
+    def test_merge_chain_start_input_eagerly_updates_metadata(self) -> None:
+        """_merge_chain_start_input should pull 'input' payload from data into _final_state."""
+        from app.remote.renderer import StreamEvent, StreamRenderer
+
+        renderer = StreamRenderer()
+        assert "alert_name" not in renderer._final_state
+
+        # Construct on_chain_start style event carrying metadata in input
+        event = StreamEvent(
+            event_type="events",
+            node_name="diagnose",
+            kind="on_chain_start",
+            data={
+                "name": "diagnose",
+                "data": {
+                    "input": {"alert_name": "late-breaking-alert", "pipeline_name": "test-pipeline"}
+                },
+            },
+        )
+
+        renderer._merge_chain_start_input(event)
+
+        assert renderer._final_state.get("alert_name") == "late-breaking-alert"
+        assert renderer._final_state.get("pipeline_name") == "test-pipeline"

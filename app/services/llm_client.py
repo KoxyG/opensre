@@ -13,7 +13,7 @@ import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from app.integrations.llm_cli.registry import CLIProviderRegistration
@@ -29,6 +29,7 @@ from anthropic import (
 )
 from anthropic import BadRequestError as AnthropicBadRequestError
 from openai import APIConnectionError as OpenAIConnectionError
+from openai import APITimeoutError as OpenAITimeoutError
 from openai import AuthenticationError as OpenAIAuthError
 from openai import BadRequestError as OpenAIBadRequestError
 from openai import NotFoundError as OpenAINotFoundError
@@ -178,7 +179,7 @@ class LLMClient:
                     "Check your configured model name and try again."
                 ) from err
             except AnthropicBadRequestError as err:
-                raise RuntimeError(f"Anthropic request rejected (HTTP 400): {err.message}") from err
+                raise RuntimeError(_format_anthropic_bad_request(err)) from err
             except GuardrailBlockedError:
                 raise
             except Exception as err:
@@ -226,7 +227,7 @@ class LLMClient:
                     "Check your configured model name and try again."
                 ) from err
             except AnthropicBadRequestError as err:
-                raise RuntimeError(f"Anthropic request rejected (HTTP 400): {err.message}") from err
+                raise RuntimeError(_format_anthropic_bad_request(err)) from err
             except GuardrailBlockedError:
                 raise
             except Exception as err:
@@ -332,11 +333,17 @@ class BedrockLLMClient:
                 break
             except AnthropicBadRequestError as err:
                 err_msg = str(err)
-                if "on-demand throughput" in err_msg or "inference profile" in err_msg.lower():
+                err_msg_lower = err_msg.lower()
+                if "on-demand throughput" in err_msg or "inference profile" in err_msg_lower:
                     raise RuntimeError(
                         f"Bedrock model '{self._model}' requires a cross-region inference profile. "
                         f"Try prefixing with 'us.' (e.g. 'us.{self._model}') and update "
                         "BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL."
+                    ) from err
+                if "usage limits" in err_msg_lower:
+                    raise RuntimeError(
+                        f"Anthropic billing quota exceeded for Bedrock model '{self._model}'. "
+                        "Check your account plan and usage limits."
                     ) from err
                 raise RuntimeError(
                     f"Bedrock Anthropic request rejected (HTTP 400) for model "
@@ -425,9 +432,32 @@ class BedrockLLMClient:
                         "Check the model ID, region, or inference profile."
                     ) from err
                 if code in ("AccessDeniedException", "UnauthorizedException"):
+                    # AccessDeniedException is overloaded on Bedrock: it can mean
+                    # missing IAM, missing per-region/per-model Bedrock access
+                    # opt-in, or an AWS Marketplace billing problem (e.g.
+                    # ``INVALID_PAYMENT_INSTRUMENT``). Surface the upstream
+                    # AWS-provided reason so the user knows which one to fix
+                    # — see issue #1808.
+                    err_msg = err.response.get("Error", {}).get("Message", "") or ""
+                    err_msg_str = str(err_msg)
+                    if (
+                        "INVALID_PAYMENT_INSTRUMENT" in err_msg_str
+                        or "payment instrument" in err_msg_str.lower()
+                    ):
+                        aws_message = err_msg_str.strip().rstrip(".")
+                        detail = f" Cause: {aws_message}." if aws_message else ""
+                        raise RuntimeError(
+                            f"Access denied for Bedrock model '{self._model}'.{detail} "
+                            "A valid AWS payment instrument is required — add a payment method "
+                            "to your AWS account or check your AWS Marketplace subscription."
+                        ) from err
+                    aws_message = err_msg_str.strip().rstrip(".")
+                    detail = f" Cause: {aws_message}." if aws_message else ""
                     raise RuntimeError(
-                        f"Access denied for Bedrock model '{self._model}'. "
-                        "Check your AWS IAM permissions and account configuration."
+                        f"Access denied for Bedrock model '{self._model}'.{detail} "
+                        "Check Bedrock model access (per-region opt-in), your "
+                        "AWS Marketplace subscription / payment method, and "
+                        "IAM permissions."
                     ) from err
                 last_err = err
                 if attempt == max_attempts - 1:
@@ -482,6 +512,18 @@ class BedrockLLMClient:
         yield self.invoke(prompt_or_messages).content
 
 
+def _format_anthropic_bad_request(err: AnthropicBadRequestError) -> str:
+    """Return a user-facing message for Anthropic HTTP 400 errors."""
+    body = getattr(err, "body", None)
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        api_msg = error_obj.get("message") if isinstance(error_obj, dict) else None
+        api_msg = api_msg if isinstance(api_msg, str) else ""
+        if "usage limit" in api_msg.lower():
+            return f"Anthropic API usage limit reached. {api_msg}"
+    return f"Anthropic request rejected (HTTP 400): {err.message}"
+
+
 def _format_anthropic_retry_error(err: Exception) -> str:
     """Format a user-facing Anthropic retry failure message."""
     error_name = type(err).__name__
@@ -505,8 +547,28 @@ def _format_anthropic_retry_error(err: Exception) -> str:
     return f"Anthropic API request failed after multiple retries: {error_name}."
 
 
+# LiteLLM/Anthropic surfaces an unrecognized model ID as an HTTP 400 with a
+# message containing "The provided model identifier is invalid." (note: the
+# OpenAI-compatible 404 code-path is preferred, but LiteLLM relays 400 here).
+# Detection is intentionally a substring match because there is no stable error
+# code for this case across LiteLLM/Anthropic. Update this constant if upstream
+# rewords the message — the failure mode is "fall through to a generic HTTP 400
+# message that is not Sentry-filtered" (see issue #1806).
+_OPENAI_INVALID_MODEL_IDENTIFIER_PHRASE = "model identifier"
+
+
+def _is_openai_invalid_model_identifier(err: OpenAIBadRequestError) -> bool:
+    """True if the OpenAIBadRequestError message indicates an unknown model id."""
+    return _OPENAI_INVALID_MODEL_IDENTIFIER_PHRASE in (err.message or "").lower()
+
+
 def _format_openai_connection_error(err: Exception, provider_label: str) -> str:
     """Return a user-facing message for an OpenAI APIConnectionError."""
+    if isinstance(err, OpenAITimeoutError):
+        return (
+            f"{provider_label} API request timed out. "
+            "Check that the service is running and responsive at the configured endpoint."
+        )
     cause: BaseException | None = err
     cause_text_parts: list[str] = []
     while cause is not None:
@@ -676,11 +738,23 @@ class OpenAILLMClient:
                     "Check your configured model name or endpoint."
                 ) from err
             except OpenAIBadRequestError as err:
+                if _is_openai_invalid_model_identifier(err):
+                    raise RuntimeError(
+                        f"{self._provider_label} model '{self._model}' was not found. "
+                        "Check your configured model name or endpoint."
+                    ) from err
                 raise RuntimeError(
                     f"{self._provider_label} request rejected (HTTP 400): {err.message}"
                 ) from err
             except GuardrailBlockedError:
                 raise
+            except OpenAITimeoutError as err:
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        _format_openai_connection_error(err, self._provider_label)
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
             except OpenAIConnectionError as err:
                 raise RuntimeError(
                     _format_openai_connection_error(err, self._provider_label)
@@ -760,11 +834,25 @@ class OpenAILLMClient:
                     "Check your configured model name or endpoint."
                 ) from err
             except OpenAIBadRequestError as err:
+                if _is_openai_invalid_model_identifier(err):
+                    raise RuntimeError(
+                        f"{self._provider_label} model '{self._model}' was not found. "
+                        "Check your configured model name or endpoint."
+                    ) from err
                 raise RuntimeError(
                     f"{self._provider_label} request rejected (HTTP 400): {err.message}"
                 ) from err
             except GuardrailBlockedError:
                 raise
+            except OpenAITimeoutError as err:
+                if emitted:
+                    raise
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        _format_openai_connection_error(err, self._provider_label)
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
             except OpenAIConnectionError as err:
                 if emitted:
                     raise
@@ -906,6 +994,15 @@ def _extract_json_payload(text: str) -> Any:
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = cleaned.strip()
+    else:
+        # LLM may prefix the code block with prose ("Here is the JSON:")
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            try:
+                return _safe_json_loads(candidate)
+            except json.JSONDecodeError:
+                pass
 
     try:
         return _safe_json_loads(cleaned)
@@ -936,13 +1033,15 @@ def _extract_json_payload(text: str) -> Any:
 # Protocol keeps static type safety for CLI-backed clients without runtime import cycles.
 _LLMClientType = LLMClient | OpenAILLMClient | BedrockLLMClient | SupportsLLMInvoke
 _llm: _LLMClientType | None = None
+_llm_for_classification: _LLMClientType | None = None
 _llm_for_tools: _LLMClientType | None = None
 
 
 def reset_llm_singletons() -> None:
     """Clear cached LLM clients (tests, benchmarks, alternate configs)."""
-    global _llm, _llm_for_tools
+    global _llm, _llm_for_classification, _llm_for_tools
     _llm = None
+    _llm_for_classification = None
     _llm_for_tools = None
 
 
@@ -953,31 +1052,45 @@ def _get_cli_provider_registration(provider: str) -> CLIProviderRegistration | N
     return get_cli_provider_registration(provider)
 
 
-def _create_llm_client(model_type: str) -> _LLMClientType:
+# Three-tier model selection: highest-cost reasoning > mid-tier classification > cheapest toolcall.
+ModelType = Literal["reasoning", "classification", "toolcall"]
+
+
+def _select_model(settings: Any, provider_prefix: str, model_type: ModelType) -> str:
+    """Look up the per-provider model field for the requested tier.
+
+    Reads ``{provider_prefix}_{model_type}_model`` off the validated
+    :class:`LLMSettings` instance. Centralises the dispatch so adding a new
+    tier (e.g. the ``classification`` tier added for the interactive-shell
+    intent classifier) only requires extending the settings model rather
+    than touching every per-provider branch in :func:`_create_llm_client`.
+    """
+    attr = f"{provider_prefix}_{model_type}_model"
+    return str(getattr(settings, attr))
+
+
+def _create_llm_client(model_type: ModelType) -> _LLMClientType:
     try:
         settings = LLMSettings.from_env()
     except ValidationError as exc:
+        errors = exc.errors()
+        if len(errors) == 1:
+            msg = re.sub(r"^[Vv]alue error,\s*", "", errors[0].get("msg", "")).strip()
+            raise RuntimeError(msg or str(exc)) from exc
         raise RuntimeError(str(exc)) from exc
     provider = settings.provider
     if provider == "openai":
         config = OPENAI_LLM_CONFIG
-        model = (
-            settings.openai_reasoning_model
-            if model_type == "reasoning"
-            else settings.openai_toolcall_model
+        return OpenAILLMClient(
+            model=_select_model(settings, "openai", model_type),
+            max_tokens=config.max_tokens,
         )
-        return OpenAILLMClient(model=model, max_tokens=config.max_tokens)
     elif provider == "openrouter":
         from app.config import OPENROUTER_LLM_CONFIG
 
         config = OPENROUTER_LLM_CONFIG
-        model = (
-            settings.openrouter_reasoning_model
-            if model_type == "reasoning"
-            else settings.openrouter_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "openrouter", model_type),
             max_tokens=config.max_tokens,
             base_url=OPENROUTER_BASE_URL,
             api_key_env="OPENROUTER_API_KEY",
@@ -986,13 +1099,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import REQUESTY_BASE_URL, REQUESTY_LLM_CONFIG
 
         config = REQUESTY_LLM_CONFIG
-        model = (
-            settings.requesty_reasoning_model
-            if model_type == "reasoning"
-            else settings.requesty_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "requesty", model_type),
             max_tokens=config.max_tokens,
             base_url=REQUESTY_BASE_URL,
             api_key_env="REQUESTY_API_KEY",
@@ -1002,13 +1110,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import GEMINI_LLM_CONFIG
 
         config = GEMINI_LLM_CONFIG
-        model = (
-            settings.gemini_reasoning_model
-            if model_type == "reasoning"
-            else settings.gemini_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "gemini", model_type),
             max_tokens=config.max_tokens,
             base_url=GEMINI_BASE_URL,
             api_key_env="GEMINI_API_KEY",
@@ -1017,13 +1120,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import NVIDIA_LLM_CONFIG
 
         config = NVIDIA_LLM_CONFIG
-        model = (
-            settings.nvidia_reasoning_model
-            if model_type == "reasoning"
-            else settings.nvidia_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "nvidia", model_type),
             max_tokens=config.max_tokens,
             base_url=NVIDIA_BASE_URL,
             api_key_env="NVIDIA_API_KEY",
@@ -1032,13 +1130,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import MINIMAX_LLM_CONFIG
 
         config = MINIMAX_LLM_CONFIG
-        model = (
-            settings.minimax_reasoning_model
-            if model_type == "reasoning"
-            else settings.minimax_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "minimax", model_type),
             max_tokens=config.max_tokens,
             base_url=MINIMAX_BASE_URL,
             api_key_env="MINIMAX_API_KEY",
@@ -1047,6 +1140,7 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
     elif provider == "ollama":
         from app.config import OLLAMA_LLM_CONFIG
 
+        # Ollama exposes a single local model regardless of tier.
         config = OLLAMA_LLM_CONFIG
         host = settings.ollama_host.rstrip("/")
         return OpenAILLMClient(
@@ -1060,12 +1154,10 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import BEDROCK_LLM_CONFIG
 
         config = BEDROCK_LLM_CONFIG
-        model = (
-            settings.bedrock_reasoning_model
-            if model_type == "reasoning"
-            else settings.bedrock_toolcall_model
+        return BedrockLLMClient(
+            model=_select_model(settings, "bedrock", model_type),
+            max_tokens=config.max_tokens,
         )
-        return BedrockLLMClient(model=model, max_tokens=config.max_tokens)
     elif (cli_reg := _get_cli_provider_registration(provider)) is not None:
         from app.config import DEFAULT_MAX_TOKENS
         from app.integrations.llm_cli.runner import CLIBackedLLMClient
@@ -1079,19 +1171,17 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         )
     else:
         config = ANTHROPIC_LLM_CONFIG
-        model = (
-            settings.anthropic_reasoning_model
-            if model_type == "reasoning"
-            else settings.anthropic_toolcall_model
+        return LLMClient(
+            model=_select_model(settings, "anthropic", model_type),
+            max_tokens=config.max_tokens,
         )
-        return LLMClient(model=model, max_tokens=config.max_tokens)
 
 
 def get_llm_for_reasoning() -> _LLMClientType:
     """
     Get or create the LLM client singleton for complex reasoning tasks.
 
-    Uses the full-capability model (e.g., Claude Opus, GPT-4o) for:
+    Uses the full-capability model (e.g., Claude Opus, GPT-5) for:
     - Root cause diagnosis and multi-step analysis
     - Evidence categorization and claim validation
 
@@ -1104,12 +1194,34 @@ def get_llm_for_reasoning() -> _LLMClientType:
     return _llm
 
 
+def get_llm_for_classification() -> _LLMClientType:
+    """
+    Get or create the LLM client singleton for the mid-tier classification tier.
+
+    Uses a Sonnet-class model (Claude Sonnet for Anthropic/Bedrock/Requesty,
+    Gemini Flash for Gemini, GPT-5 mini for OpenAI). Heavier and slower than
+    the toolcall tier but markedly more capable on tasks that need real
+    instruction-following — e.g. interactive-shell intent classification —
+    while still being substantially cheaper than the reasoning tier.
+
+    Override the per-provider model via ``<PROVIDER>_CLASSIFICATION_MODEL``
+    (e.g. ``ANTHROPIC_CLASSIFICATION_MODEL=claude-sonnet-4-6``).
+    """
+    global _llm_for_classification
+    if _llm_for_classification is None:
+        _llm_for_classification = _create_llm_client(model_type="classification")
+    return _llm_for_classification
+
+
 def get_llm_for_tools() -> _LLMClientType:
     """
     Get or create a lightweight LLM client for tool selection and action planning.
 
-    Uses toolcall models (Claude Haiku for Anthropic, GPT-4o mini for OpenAI)
+    Uses toolcall models (Claude Haiku for Anthropic, GPT-5 mini for OpenAI)
     for lower cost and faster inference on simple routing decisions.
+
+    For tasks that need stronger instruction-following than Haiku-tier models
+    can reliably provide, use :func:`get_llm_for_classification` instead.
     """
     global _llm_for_tools
     if _llm_for_tools is None:
