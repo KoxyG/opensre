@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any
 
 from app.agent.prompt import build_system_prompt, format_alert_context
@@ -22,6 +22,7 @@ from app.utils.tool_trace import redact_sensitive
 logger = logging.getLogger(__name__)
 
 _TOOL_EXECUTOR_WORKERS = 10
+_UNSET: object = object()  # sentinel distinguishing "not yet started" from a None tool result
 
 # Maps alert_source → tool source keys. Tools from these sources are auto-called
 # before the LLM loop starts when the alert source is known.
@@ -50,6 +51,7 @@ _ALERT_SOURCE_TO_TOOL_SOURCES: dict[str, list[str]] = {
     "betterstack": ["betterstack"],
     "azure": ["azure", "azure_sql"],
     "splunk": ["splunk"],
+    "signoz": ["signoz"],
 }
 
 # Callback type: called with (event_kind, data_dict) during the agent loop.
@@ -124,7 +126,7 @@ class ConnectedInvestigationAgent:
         # Before the LLM loop: deterministically run the primary integration tools
         # based on the alert source. This guarantees the LLM always sees real data
         # from the right integration first, regardless of what it would have chosen.
-        seed_calls = _build_seed_calls(state, tools)
+        seed_calls = _build_seed_calls(state, tools, llm)
         if seed_calls:
             logger.debug("[agent] seeding %d primary tool calls before LLM loop", len(seed_calls))
             for tc in seed_calls:
@@ -162,7 +164,62 @@ class ConnectedInvestigationAgent:
         for iteration in range(MAX_INVESTIGATION_LOOPS):
             logger.debug("[agent] iteration=%d", iteration)
             _emit("llm_start", {"iteration": iteration})
-            response = llm.invoke(messages, system=system, tools=tool_schemas)
+            try:
+                response = llm.invoke(messages, system=system, tools=tool_schemas)
+
+            except RuntimeError as err:
+                err_msg = str(err).lower()
+                if ("model" in err_msg and "not found" in err_msg) or "404" in err_msg:
+                    error_msg = (
+                        "Error: The AI model was not found (404). "
+                        "If using a local LLM, verify the model name in your .env file."
+                    )
+                    remediation_steps = [
+                        "Check your .env configuration",
+                        "Verify the model name is correct",
+                        "Ensure the model is downloaded locally",
+                        "Confirm your provider supports this model",
+                    ]
+                    tracker.error("investigation_agent", message="Failed: Model not found")
+                elif "does not support tool" in err_msg or "only supports single tool" in err_msg:
+                    error_msg = (
+                        "Error: The configured model does not support tool calling. "
+                        "The investigation agent requires a model with native tool-calling support."
+                    )
+                    remediation_steps = [
+                        "Switch to a model that supports tool calling (e.g. claude-opus-4-7, gpt-4o)",
+                        "For Ollama: use llama3.1, qwen2.5, or another tool-call-capable model",
+                        "Check your LLM_MODEL or LLM_PROVIDER setting in .env",
+                    ]
+                    tracker.error(
+                        "investigation_agent", message="Failed: Model does not support tools"
+                    )
+                else:
+                    raise
+                _emit(
+                    "agent_end",
+                    {
+                        "root_cause": error_msg,
+                        "validity_score": 0.0,
+                        "root_cause_category": "Configuration Error",
+                    },
+                )
+                updates = {
+                    "root_cause": error_msg,
+                    "root_cause_category": "Configuration Error",
+                    "causal_chain": [f"Model API returned error: {str(err)}"],
+                    "validated_claims": [],
+                    "non_validated_claims": [],
+                    "remediation_steps": remediation_steps,
+                    "validity_score": 0.0,
+                    "investigation_recommendations": [],
+                    "evidence": evidence,
+                    "evidence_entries": [e.model_dump() for e in evidence_entries],
+                    "agent_messages": messages,
+                    "executed_hypotheses": executed_hypotheses,
+                }
+                updates.update(tool_context)
+                return updates
 
             messages.append(_build_assistant_msg(llm, response))
 
@@ -206,7 +263,12 @@ class ConnectedInvestigationAgent:
                 MAX_INVESTIGATION_LOOPS,
             )
 
-        result = parse_diagnosis(messages, evidence, state.get("alert_name", ""))
+        result = parse_diagnosis(
+            messages,
+            evidence,
+            state.get("alert_name", ""),
+            alert_source=_get_alert_source(state),
+        )
         result.evidence = evidence
         result.evidence_entries = [e.model_dump() for e in evidence_entries]
         result.agent_messages = messages
@@ -294,7 +356,11 @@ def _build_connected_tool_context(
     }
 
 
-def _build_seed_calls(state: dict[str, Any], tools: list[RegisteredTool]) -> list[ToolCall]:
+def _build_seed_calls(
+    state: dict[str, Any],
+    tools: list[RegisteredTool],
+    llm: Any,
+) -> list[ToolCall]:
     """Return tool calls to run before the LLM loop based on the alert source.
 
     Picks all available tools whose source matches the alert's primary integration.
@@ -313,15 +379,18 @@ def _build_seed_calls(state: dict[str, Any], tools: list[RegisteredTool]) -> lis
     if not seed_tools:
         return []
 
+    from app.services.agent_llm_client import BedrockConverseAgentClient
+    from app.services.bedrock_converse import new_tool_use_id
+
+    use_converse_ids = isinstance(llm, BedrockConverseAgentClient)
     calls: list[ToolCall] = []
     for tool in seed_tools:
         try:
             injected = tool.extract_params(resolved)
         except Exception:
             injected = {}
-        calls.append(
-            ToolCall(id=f"seed_{tool.name}", name=tool.name, input=_public_tool_input(injected))
-        )
+        tool_id = new_tool_use_id() if use_converse_ids else f"seed_{tool.name}"
+        calls.append(ToolCall(id=tool_id, name=tool.name, input=_public_tool_input(injected)))
 
     return calls
 
@@ -355,7 +424,17 @@ def _build_synthetic_assistant_tool_call_msg(
     This lets us inject pre-seeded tool results into the conversation in a format
     the LLM client already understands, without adding special-case handling.
     """
-    from app.services.agent_llm_client import AnthropicAgentClient, OpenAIAgentClient
+    from app.services.agent_llm_client import (
+        AnthropicAgentClient,
+        BedrockConverseAgentClient,
+        CLIBackedAgentClient,
+        OpenAIAgentClient,
+    )
+
+    if isinstance(llm, BedrockConverseAgentClient):
+        from app.services.bedrock_converse import build_assistant_tool_use_message
+
+        return build_assistant_tool_use_message(tool_calls)
 
     if isinstance(llm, AnthropicAgentClient):
         content = [
@@ -383,6 +462,9 @@ def _build_synthetic_assistant_tool_call_msg(
             ],
         }
 
+    if isinstance(llm, CLIBackedAgentClient):
+        return llm.build_assistant_message("", tool_calls)
+
     # Fallback: plain text summary
     names = ", ".join(tc.name for tc in tool_calls)
     return {"role": "assistant", "content": f"I will start by querying: {names}"}
@@ -400,6 +482,9 @@ def _run_parallel(
         if tool is None:
             return {"error": f"unknown tool: {tc.name}"}
         try:
+            validation_error = tool.validate_public_input(tc.input)
+            if validation_error:
+                return {"error": validation_error}
             injected = tool.extract_params(resolved_integrations)
             kwargs = {**injected, **tc.input}
             return tool.run(**kwargs)
@@ -410,11 +495,31 @@ def _run_parallel(
     if len(tool_calls) == 1:
         return [_call(tool_calls[0])]
 
-    results: list[Any] = [None] * len(tool_calls)
-    with ThreadPoolExecutor(max_workers=min(_TOOL_EXECUTOR_WORKERS, len(tool_calls))) as pool:
-        futures = {pool.submit(_call, tc): i for i, tc in enumerate(tool_calls)}
-        for fut in as_completed(futures):
-            results[futures[fut]] = fut.result()
+    results: list[Any] = [_UNSET] * len(tool_calls)
+    submitted: dict[
+        Future[Any], int
+    ] = {}  # future -> index, built incrementally to survive partial submit
+    try:
+        with ThreadPoolExecutor(max_workers=min(_TOOL_EXECUTOR_WORKERS, len(tool_calls))) as pool:
+            for i, tc in enumerate(tool_calls):
+                submitted[pool.submit(_call, tc)] = i
+            for fut in as_completed(submitted):
+                try:
+                    results[submitted[fut]] = fut.result()
+                except Exception as fut_exc:  # noqa: BLE001  # lgtm[py/catch-base-exception]
+                    results[submitted[fut]] = {"error": str(fut_exc)}
+    except RuntimeError as exc:
+        # interpreter is shutting down; executor.__exit__ has already waited for submitted futures
+        logger.warning("[_run_parallel] RuntimeError – falling back to sequential: %s", exc)
+        for fut, i in submitted.items():
+            if results[i] is _UNSET and fut.done():
+                try:
+                    results[i] = fut.result()
+                except Exception as fut_exc:  # noqa: BLE001  # lgtm[py/catch-base-exception]
+                    results[i] = {"error": str(fut_exc)}
+        for i, tc in enumerate(tool_calls):
+            if results[i] is _UNSET:
+                results[i] = _call(tc)
     return results
 
 
@@ -495,17 +600,15 @@ def _merge_tool_evidence(
 
 
 def _build_assistant_msg(llm: Any, response: Any) -> dict[str, Any]:
-    from app.services.agent_llm_client import AnthropicAgentClient
+    from app.services.agent_llm_client import AnthropicAgentClient, BedrockConverseAgentClient
 
-    if isinstance(llm, AnthropicAgentClient):
+    if isinstance(llm, (AnthropicAgentClient, BedrockConverseAgentClient)):
         return llm.build_assistant_message(response.raw_content)
-    # Use the raw API message when available so provider-specific fields (e.g. Gemini
-    # thought_signature required for multi-turn function calls) are preserved.
-    result: dict[str, Any] = (
-        response.raw_content
-        if response.raw_content is not None
-        else llm.build_assistant_message(response.content, response.tool_calls)
-    )
+    # Use raw_content when set — preserves provider-specific fields such as
+    # Gemini's thought_signature that must be echoed back in the next request.
+    if response.raw_content is not None:
+        return response.raw_content  # type: ignore[no-any-return]
+    result: dict[str, Any] = llm.build_assistant_message(response.content, response.tool_calls)
     return result
 
 

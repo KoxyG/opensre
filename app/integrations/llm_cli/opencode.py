@@ -92,6 +92,8 @@ def _probe_opencode_auth_via_cli(binary_path: str) -> tuple[bool | None, str]:
             [binary_path, "auth", "list"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_AUTH_LIST_TIMEOUT_SEC,
             check=False,
             env=env,
@@ -142,6 +144,8 @@ class OpenCodeAdapter:
                 [binary_path, "--version"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=_PROBE_TIMEOUT_SEC,
                 check=False,
             )
@@ -249,7 +253,7 @@ class OpenCodeAdapter:
             bits.append("Authentication failed. Run: opencode auth login")
         elif "model" in combined and ("not found" in combined or "invalid" in combined):
             bits.append(
-                "Model not found. Check OPENCODE_MODEL format: provider/model (e.g., openai/gpt-5.4)"
+                "Model not found. Check OPENCODE_MODEL format: provider/model (e.g., openai/gpt-5.4-mini)"
             )
         elif "rate limit" in combined or "quota" in combined:
             bits.append(
