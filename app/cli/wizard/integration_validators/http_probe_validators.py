@@ -147,17 +147,18 @@ def validate_telegram_bot(*, bot_token: str) -> IntegrationHealthResult:
 
     try:
         resp = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-        resp.raise_for_status()
-        payload = resp.json()
-    except httpx.HTTPStatusError as err:
-        return IntegrationHealthResult(
-            ok=False,
-            detail=f"Telegram API check failed: HTTP {err.response.status_code}.",
-        )
     except httpx.RequestError as err:
         return IntegrationHealthResult(ok=False, detail=f"Telegram API unreachable: {err}")
     except Exception as err:
         return IntegrationHealthResult(ok=False, detail=f"Telegram API check failed: {err}")
+
+    try:
+        payload = resp.json()
+    except Exception as err:
+        return IntegrationHealthResult(
+            ok=False,
+            detail=f"Telegram API check failed: HTTP {resp.status_code} ({err}).",
+        )
 
     if not payload.get("ok"):
         description = payload.get("description", "unknown error")

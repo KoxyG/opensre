@@ -541,9 +541,9 @@ def _setup_telegram() -> None:
     default_chat_id = _p("Default chat ID (optional)")
     print("\n  Validating Telegram bot token...")
     result = validate_telegram_bot(bot_token=bot_token)
-    print(f"  {result.detail}")
     if not result.ok:
-        sys.exit(1)
+        _die(result.detail)
+    print(f"  {result.detail}")
     upsert_integration(
         "telegram",
         {

@@ -515,7 +515,6 @@ def test_validate_telegram_bot_succeeds(monkeypatch: pytest.MonkeyPatch) -> None
         "httpx.get",
         lambda *_a, **_kw: types.SimpleNamespace(
             status_code=200,
-            raise_for_status=lambda: None,
             json=lambda: {"ok": True, "result": {"username": "opensre_bot"}},
         ),
     )
@@ -535,13 +534,28 @@ def test_validate_telegram_bot_api_not_ok(monkeypatch: pytest.MonkeyPatch) -> No
         "httpx.get",
         lambda *_a, **_kw: types.SimpleNamespace(
             status_code=200,
-            raise_for_status=lambda: None,
             json=lambda: {"ok": False, "description": "Unauthorized"},
         ),
     )
     result = validate_telegram_bot(bot_token="bad-token")
     assert result.ok is False
     assert "unauthorized" in result.detail.lower()
+
+
+def test_validate_telegram_bot_http_error_includes_api_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "httpx.get",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            status_code=401,
+            json=lambda: {"ok": False, "description": "Unauthorized"},
+        ),
+    )
+    result = validate_telegram_bot(bot_token="bad-token")
+    assert result.ok is False
+    assert "unauthorized" in result.detail.lower()
+    assert "http 401" not in result.detail.lower()
 
 
 def test_validate_telegram_bot_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
