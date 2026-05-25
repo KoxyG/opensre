@@ -532,6 +532,31 @@ def _setup_discord() -> None:
     _register_discord_slash_command(application_id, bot_token)
 
 
+def _setup_telegram() -> None:
+    from app.cli.wizard.integration_health import validate_telegram_bot
+
+    bot_token = _p("Telegram bot token", secret=True)
+    if not bot_token:
+        _die("bot_token is required.")
+    default_chat_id = _p("Default chat ID (optional)")
+    print("\n  Validating Telegram bot token...")
+    result = validate_telegram_bot(bot_token=bot_token)
+    print(f"  {result.detail}")
+    if not result.ok:
+        sys.exit(1)
+    upsert_integration(
+        "telegram",
+        {
+            "credentials": {
+                "bot_token": bot_token,
+                "default_chat_id": default_chat_id or None,
+            }
+        },
+    )
+    print("  Next:")
+    print("    - opensre integrations verify telegram")
+
+
 def _setup_whatsapp() -> None:
     account_sid = _p("Twilio Account SID (starts with AC...)")
     auth_token = _p("Twilio Auth Token", secret=True)
@@ -825,6 +850,7 @@ _HANDLERS: dict[str, Any] = {
     "sentry": _setup_sentry,
     "mongodb": _setup_mongodb,
     "discord": _setup_discord,
+    "telegram": _setup_telegram,
     "whatsapp": _setup_whatsapp,
     "twilio": _setup_twilio,
     "openclaw": _setup_openclaw,

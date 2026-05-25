@@ -1676,3 +1676,129 @@ def test_run_wizard_opensearch_rejects_empty_basic_password(monkeypatch, tmp_pat
             },
         )
     ]
+
+
+def test_run_wizard_configures_telegram(monkeypatch, tmp_path) -> None:
+    select_responses = iter(["quickstart", "anthropic", "claude-opus-4-7", "telegram"])
+    password_responses = iter(["llm-secret", "123:ABC"])
+    text_responses = iter(["-1001234567890"])
+    saved_integrations: list[tuple[str, dict]] = []
+    synced_env_values: list[dict[str, str]] = []
+    synced_env_secrets: list[tuple[str, str]] = []
+
+    def _mock_select(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(select_responses)
+        return m
+
+    def _mock_password(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(password_responses)
+        return m
+
+    def _mock_text(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(text_responses)
+        return m
+
+    monkeypatch.setattr(flow, "select_prompt", _mock_select)
+    monkeypatch.setattr(flow.questionary, "password", _mock_password)
+    monkeypatch.setattr(flow.questionary, "text", _mock_text)
+    monkeypatch.setattr(flow, "get_store_path", lambda: tmp_path / "opensre.json")
+    monkeypatch.setattr(flow, "probe_local_target", lambda _path: ProbeResult("local", True, "ok"))
+    monkeypatch.setattr(
+        flow,
+        "validate_telegram_bot",
+        lambda **_kwargs: flow.IntegrationHealthResult(
+            ok=True, detail="Connected to Telegram bot @opensre_bot."
+        ),
+    )
+    monkeypatch.setattr(flow, "save_local_config", lambda **_kwargs: tmp_path / "opensre.json")
+    monkeypatch.setattr(flow, "sync_provider_env", lambda **_kwargs: tmp_path / ".env")
+    monkeypatch.setattr(flow, "save_llm_api_key", lambda *_args, **_kwargs: None)
+
+    def _sync_env_values(values: dict[str, str], **_kwargs):
+        synced_env_values.append(values)
+        return tmp_path / ".env"
+
+    def _sync_env_secret(key: str, value: str) -> None:
+        synced_env_secrets.append((key, value))
+
+    monkeypatch.setattr(flow, "sync_env_values", _sync_env_values)
+    monkeypatch.setattr(flow, "sync_env_secret", _sync_env_secret)
+    monkeypatch.setattr(
+        flow,
+        "upsert_integration",
+        lambda service, payload: saved_integrations.append((service, payload)),
+    )
+
+    exit_code = flow.run_wizard()
+
+    assert exit_code == 0
+    assert saved_integrations == [
+        (
+            "telegram",
+            {
+                "credentials": {
+                    "bot_token": "123:ABC",
+                    "default_chat_id": "-1001234567890",
+                }
+            },
+        )
+    ]
+    assert synced_env_secrets == [("TELEGRAM_BOT_TOKEN", "123:ABC")]
+    assert synced_env_values == [{"TELEGRAM_DEFAULT_CHAT_ID": "-1001234567890"}]
+
+
+def test_run_wizard_telegram_retries_on_validation_failure(monkeypatch, tmp_path) -> None:
+    select_responses = iter(["quickstart", "anthropic", "claude-opus-4-7", "telegram"])
+    password_responses = iter(["llm-secret", "bad-token", "123:GOOD"])
+    text_responses = iter(["-1001", "-1001"])
+    saved_integrations: list[tuple[str, dict]] = []
+    validation_call_count = 0
+
+    def _mock_select(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(select_responses)
+        return m
+
+    def _mock_password(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(password_responses)
+        return m
+
+    def _mock_text(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(text_responses)
+        return m
+
+    def _validate(**_kwargs):
+        nonlocal validation_call_count
+        validation_call_count += 1
+        if validation_call_count == 1:
+            return flow.IntegrationHealthResult(ok=False, detail="Telegram API check failed.")
+        return flow.IntegrationHealthResult(ok=True, detail="Connected to Telegram bot @bot.")
+
+    monkeypatch.setattr(flow, "select_prompt", _mock_select)
+    monkeypatch.setattr(flow.questionary, "password", _mock_password)
+    monkeypatch.setattr(flow.questionary, "text", _mock_text)
+    monkeypatch.setattr(flow, "get_store_path", lambda: tmp_path / "opensre.json")
+    monkeypatch.setattr(flow, "probe_local_target", lambda _path: ProbeResult("local", True, "ok"))
+    monkeypatch.setattr(flow, "validate_telegram_bot", _validate)
+    monkeypatch.setattr(flow, "save_local_config", lambda **_kwargs: tmp_path / "opensre.json")
+    monkeypatch.setattr(flow, "sync_provider_env", lambda **_kwargs: tmp_path / ".env")
+    monkeypatch.setattr(flow, "save_llm_api_key", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(flow, "sync_env_values", lambda *_a, **_kw: tmp_path / ".env")
+    monkeypatch.setattr(flow, "sync_env_secret", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        flow,
+        "upsert_integration",
+        lambda service, payload: saved_integrations.append((service, payload)),
+    )
+
+    exit_code = flow.run_wizard()
+
+    assert exit_code == 0
+    assert validation_call_count == 2
+    assert saved_integrations[0][0] == "telegram"
+    assert saved_integrations[0][1]["credentials"]["bot_token"] == "123:GOOD"
