@@ -7,7 +7,7 @@ Use this workflow when running OpenSRE via the local `opensre` binary.
 You can work in two ways:
 
 - **Interactive prompt shell** — run `opensre` with no subcommand (TTY) to enter the REPL: describe incidents conversationally, stream investigations, and use slash commands.
-- **Direct investigation** — run `opensre investigate` from your terminal with `-i` pointing at an alert payload (or `--interactive` to pick a file in the UI). The process runs and exits when the investigation completes.
+- **Direct investigation** — run `opensre investigate` from your terminal. In TTY sessions, running it with no input opens a guided picker (bundled demo alert, templates, custom file path, or paste JSON). The process runs and exits when the investigation completes.
 
 ## 1) Start an investigation
 
@@ -31,7 +31,7 @@ Pass an alert payload to `opensre investigate`:
 opensre investigate -i tests/e2e/kubernetes/fixtures/datadog_k8s_alert.json
 ```
 
-You can also use `--interactive` to pick an input file from your terminal UI.
+In TTY terminals, running `opensre investigate` with no `--input`, `--input-json`, or piped stdin opens a guided picker with bundled sample/template options.
 
 ## 2) Review investigation artifacts
 
