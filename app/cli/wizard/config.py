@@ -76,23 +76,29 @@ class ProviderOption:
     allow_custom_models: bool = False
 
 
+# Source: https://docs.anthropic.com/en/docs/about-claude/models/overview
 ANTHROPIC_MODELS = (
     ModelOption(value=ANTHROPIC_REASONING_MODEL, label="Claude Opus 4.7"),
-    ModelOption(value="claude-sonnet-4-20250514", label="Claude Sonnet 4"),
+    ModelOption(value="claude-sonnet-4-6", label="Claude Sonnet 4.6"),
+    ModelOption(value="claude-haiku-4-5", label="Claude Haiku 4.5"),
 )
 
+# Source: https://platform.openai.com/docs/models
+# Codex model IDs are intentionally omitted here: OpenSRE's direct OpenAI
+# provider uses Chat Completions, while Codex models require a different API path.
 OPENAI_MODELS = (
     ModelOption(value=OPENAI_REASONING_MODEL, label="GPT-5.4 mini"),
+    ModelOption(value="gpt-5.5", label="GPT-5.5"),
     ModelOption(value="gpt-5.4", label="GPT-5.4"),
     ModelOption(value="gpt-5.4-nano", label="GPT-5.4 nano"),
-    ModelOption(value="gpt-5.3-codex", label="GPT-5.3-Codex"),
 )
 
+# Source: https://openrouter.ai/api/v1/models
 OPENROUTER_MODELS = (
     ModelOption(value=OPENROUTER_REASONING_MODEL, label="OpenRouter Auto (smart routing)"),
-    ModelOption(value="openai/gpt-5.2", label="GPT-5.2 (via OpenRouter)"),
-    ModelOption(value="anthropic/claude-opus-4.6", label="Claude Opus 4.6 (via OpenRouter)"),
-    ModelOption(value="anthropic/claude-sonnet-4.5", label="Claude Sonnet 4.5 (via OpenRouter)"),
+    ModelOption(value="openai/gpt-5.5", label="GPT-5.5 (via OpenRouter)"),
+    ModelOption(value="anthropic/claude-opus-4.7", label="Claude Opus 4.7 (via OpenRouter)"),
+    ModelOption(value="anthropic/claude-sonnet-4.6", label="Claude Sonnet 4.6 (via OpenRouter)"),
     ModelOption(value="anthropic/claude-haiku-4.5", label="Claude Haiku 4.5 (via OpenRouter)"),
     ModelOption(
         value="google/gemini-3.1-pro-preview", label="Gemini 3.1 Pro (preview, via OpenRouter)"
@@ -270,6 +276,27 @@ GEMINI_CLI_MODELS = (
     ),
 )
 
+# Source: ``agy`` ``/models`` (verified 2026-05-26 against agy 1.0.2).
+# Empty value means "no --model" so agy uses its currently configured model.
+# Note: agy 1.0.2 does not yet expose ``--model`` in headless ``-p`` mode
+# (verified locally), so the adapter ignores any value via ``del model`` in
+# ``build()``. Catalog is forward-compat: once Google ships ``--model`` in
+# headless, the wizard selection plus ``model_env_key="ANTIGRAVITY_CLI_MODEL"``
+# will route through to ``argv`` in a one-line change to ``antigravity_cli.py``.
+# Effort variants (Low/Medium/High/Thinking) shown in ``/models`` belong on
+# opensre's existing ``reasoning_effort`` knob, not here.
+ANTIGRAVITY_CLI_MODELS = (
+    ModelOption(
+        value="",
+        label="CLI default (no --model; use agy's currently configured model)",
+    ),
+    ModelOption(value="gemini-3.5-flash", label="gemini-3.5-flash — fast"),
+    ModelOption(value="gemini-3.1-pro", label="gemini-3.1-pro — strongest Google reasoning"),
+    ModelOption(value="claude-sonnet-4.6", label="claude-sonnet-4.6 — Anthropic balanced"),
+    ModelOption(value="claude-opus-4.6", label="claude-opus-4.6 — Anthropic most capable"),
+    ModelOption(value="gpt-oss-120b", label="gpt-oss-120b — open-source"),
+)
+
 # Source: https://opencode.ai/docs/zen (verified 2026-05-21).
 # OpenCode routes models through OpenCode Zen using the ``opencode/`` prefix.
 # Curated subset of the full ~40-model catalog; the wizard's custom-ID escape
@@ -353,6 +380,12 @@ def _gemini_cli_adapter_factory() -> LLMCLIAdapter:
     from app.integrations.llm_cli.gemini_cli import GeminiCLIAdapter
 
     return GeminiCLIAdapter()
+
+
+def _antigravity_cli_adapter_factory() -> LLMCLIAdapter:
+    from app.integrations.llm_cli.antigravity_cli import AntigravityCLIAdapter
+
+    return AntigravityCLIAdapter()
 
 
 def _opencode_adapter_factory() -> LLMCLIAdapter:
@@ -559,6 +592,19 @@ SUPPORTED_PROVIDERS = (
         credential_kind="cli",
         credential_secret=False,
         adapter_factory=_gemini_cli_adapter_factory,
+        allow_custom_models=True,
+    ),
+    ProviderOption(
+        value="antigravity-cli",
+        label="Google Antigravity CLI (agy)",
+        group="Local CLI providers",
+        api_key_env="",
+        model_env="ANTIGRAVITY_CLI_MODEL",
+        default_model="",
+        models=ANTIGRAVITY_CLI_MODELS,
+        credential_kind="cli",
+        credential_secret=False,
+        adapter_factory=_antigravity_cli_adapter_factory,
         allow_custom_models=True,
     ),
     ProviderOption(

@@ -251,7 +251,9 @@ def _cmd_uninstall(session: ReplSession, console: Console, args: list[str]) -> b
 
 
 def _cmd_config(session: ReplSession, console: Console, args: list[str]) -> bool:  # noqa: ARG001
-    return run_cli_command(console, ["config", *args])
+    # Non-interactive click.echo only; capture so output reaches the REPL buffer
+    # instead of the child's inherited stdout while prompt_toolkit redraws.
+    return run_cli_command(console, ["config", *args], capture_output=True)
 
 
 def _cmd_messaging(session: ReplSession, console: Console, args: list[str]) -> bool:  # noqa: ARG001

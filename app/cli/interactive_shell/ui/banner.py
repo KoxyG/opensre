@@ -95,7 +95,7 @@ def _render_art(console_width: int = 80) -> str:
     custom_font = os.getenv("OPENSRE_FIGLET_FONT")
     if custom_font:
         try:
-            import pyfiglet  # type: ignore[import-untyped,import-not-found]
+            import pyfiglet
 
             rendered: str = pyfiglet.figlet_format("OpenSRE", font=custom_font).rstrip()
             if rendered and all(len(ln) <= console_width - 2 for ln in rendered.splitlines()):
@@ -122,11 +122,20 @@ def _render_art(console_width: int = 80) -> str:
 
 def resolve_provider_models(settings: object, provider: str) -> tuple[str, str]:
     """Return the active (reasoning_model, toolcall_model) for a provider."""
-    if provider in {"codex", "claude-code", "gemini-cli", "cursor", "kimi", "opencode"}:
+    if provider in {
+        "codex",
+        "claude-code",
+        "gemini-cli",
+        "antigravity-cli",
+        "cursor",
+        "kimi",
+        "opencode",
+    }:
         env_key = {
             "codex": "CODEX_MODEL",
             "claude-code": "CLAUDE_CODE_MODEL",
             "gemini-cli": "GEMINI_CLI_MODEL",
+            "antigravity-cli": "ANTIGRAVITY_CLI_MODEL",
             "cursor": "CURSOR_MODEL",
             "kimi": "KIMI_MODEL",
             "opencode": "OPENCODE_MODEL",

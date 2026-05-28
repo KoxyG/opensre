@@ -138,6 +138,26 @@ def test_dispatch_needs_exclusive_stdin_for_onboard(
     assert loop_dispatch.dispatch_needs_exclusive_stdin("/onboard local_llm", session) is True
 
 
+def test_dispatch_needs_exclusive_stdin_for_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/config`` delegates to a subprocess; block the next prompt until output
+    is printed so config lines do not overlap the pinned input bar.
+    """
+    monkeypatch.setattr(loop_dispatch, "repl_tty_interactive", lambda: True)
+    session = ReplSession()
+
+    assert loop_dispatch.dispatch_needs_exclusive_stdin("/config", session) is True
+    assert loop_dispatch.dispatch_needs_exclusive_stdin("/config show", session) is True
+    assert (
+        loop_dispatch.dispatch_needs_exclusive_stdin(
+            "/config set interactive.layout pinned",
+            session,
+        )
+        is True
+    )
+
+
 def test_dispatch_one_turn_routes_to_cli_help_for_help_questions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
