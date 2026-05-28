@@ -127,7 +127,7 @@ def _choose_guided_payload() -> dict[str, Any]:
         try:
             choice = input("Select an option: ").strip()
         except (EOFError, KeyboardInterrupt) as exc:
-            raise SystemExit("No alert input selected.") from exc
+            raise SystemExit(0) from exc
         target = valid_choices.get(choice)
         if target is None:
             print("Invalid selection. Enter one of the menu numbers.", file=sys.stderr)
@@ -140,13 +140,15 @@ def _choose_guided_payload() -> dict[str, Any]:
             try:
                 custom_path = input("Alert file path: ").strip()
             except (EOFError, KeyboardInterrupt) as exc:
-                raise SystemExit("No alert input selected.") from exc
+                raise SystemExit(0) from exc
             if not custom_path:
                 print("Alert file path cannot be empty.", file=sys.stderr)
                 continue
             return load_file(custom_path)
         if target == "paste_json":
             return load_interactive()
+        if target == "cancel":
+            raise SystemExit(0)
         raise SystemExit("No alert input selected.")
 
 
